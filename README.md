@@ -54,8 +54,15 @@ colab-bridge --port 8766 start      # link, log and process id in ~/.cache/colab
 colab-bridge --port 8766 run cell.py
 ```
 
-`--dir` (or `COLAB_BRIDGE_DIR`) moves that state elsewhere; `COLAB_BRIDGE_PORT` sets the default port. Each connected
-tab is its own Colab runtime and uses compute units on its own.
+`--dir` (or `COLAB_BRIDGE_DIR`) moves that state elsewhere; `COLAB_BRIDGE_PORT` sets the default port.
+
+Tabs opened from these links share one runtime and one kernel: the link always opens colab-mcp's scratch notebook
+(`notebooks/empty.ipynb`), and Colab connects tabs of the same notebook to the same runtime. A second tab adds a
+control channel, not a machine, and uses no extra compute units. Everything else is shared too:
+
+- a cell running from one tab makes the other tab's cells wait, so keep cells short and run long jobs in the background;
+- files, the working directory, environment variables and GPU memory are the same for both;
+- releasing or restarting the runtime from one tab stops the other tab's work as well.
 
 ## From Python
 
