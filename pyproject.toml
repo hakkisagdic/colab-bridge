@@ -1,0 +1,32 @@
+[project]
+name = "colab-bridge"
+version = "0.1.0"
+description = "Keep a Google Colab tab connected to your machine and drive its notebook from scripts: run cells, fetch files."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Hakki Sagdic" }]
+requires-python = ">=3.13"
+dependencies = [
+    # googlecolab/colab-mcp (Apache-2.0) talks to the Colab tab; pinned to the commit this bridge was built on.
+    "colab-mcp @ git+https://github.com/googlecolab/colab-mcp@b9ab3899e0f1fa493390b1fd6d54aa2e464ecdf1",
+]
+
+[project.scripts]
+colab-bridge = "colab_bridge.cli:main"
+
+[project.urls]
+Source = "https://github.com/hakkisagdic/colab-bridge"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/colab_bridge"]
