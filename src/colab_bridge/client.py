@@ -5,6 +5,8 @@ The bridge listens on 127.0.0.1 and takes one JSON line per connection:
   {"op": "status"}                                  -> {"ok": true, "result": {"connected": bool, "error": str|null}}
   {"op": "list"}                                    -> the notebook tools the Colab tab offers
   {"op": "call", "name": TOOL, "args": {...}}       -> the tool's MCP result
+  {"op": "run", "code": CODE, "project": NAME}      -> {"output": str, "runtime": {"host", "gpu"}}: the code as a cell,
+                                                       one request at a time (colab_bridge.notebook.run_flow)
 Errors come back as {"ok": false, "error": "..."}.
 """
 
@@ -12,8 +14,11 @@ import base64
 import hashlib
 import json
 import os
-import re
 import socket
+import sys
+
+from colab_bridge import notebook
+from colab_bridge.notebook import output_text  # noqa: F401 (part of this module's interface)
 
 DEFAULT_PORT = 8765
 FETCH_PART_BYTES = 4 << 20  # base64 makes a part about 5.6 MB of cell output
@@ -55,44 +60,45 @@ def status(port: int = None) -> dict:
     return request({"op": "status"}, port, timeout=30)
 
 
-def call_tool(name: str, args: dict, port: int = None):
-    """Calls one of the Colab tab's notebook tools (get_cells, add_code_cell, update_cell, run_code_cell, ...)."""
-    result = request({"op": "call", "name": name, "args": args}, port)
+def tool_value(name: str, result: dict):
+    """A notebook tool's answer from its MCP result: the structured content, or the text content read as JSON."""
     if result.get("isError"):
         raise BridgeError(f"{name} failed: " + json.dumps(result.get("content"), ensure_ascii=False)[:2000])
     return result.get("structuredContent") or json.loads("".join(c.get("text", "") for c in result["content"]))
 
 
-def output_text(outputs) -> str:
-    """What a cell printed: stream text, errors as "Name: value", and plain-text display data, without ANSI colours."""
-    parts = []
-    for output in outputs or []:
-        if "text" in output:
-            text = output["text"]
-            parts.append("".join(text) if isinstance(text, list) else str(text))
-        elif output.get("output_type") == "error":
-            parts.append(f"{output.get('ename')}: {output.get('evalue')}")
-        elif "data" in output:
-            plain = output["data"].get("text/plain", "")
-            parts.append("".join(plain) if isinstance(plain, list) else str(plain))
-    return re.sub(r"\x1b\[[0-9;]*m", "", "".join(parts))
+def call_tool(name: str, args: dict, port: int = None):
+    """Calls one of the Colab tab's notebook tools (get_cells, add_code_cell, update_cell, run_code_cell, ...)."""
+    return tool_value(name, request({"op": "call", "name": name, "args": args}, port))
 
 
-def run_cell(code: str, port: int = None) -> str:
-    """Runs code as a notebook cell and returns what it printed. A cell whose first line is the same is updated and run
-    again instead of adding another, so a script that starts with a title comment does not pile up cells."""
-    cells = call_tool("get_cells", {"cellIndexStart": 0, "cellIndexEnd": 1000, "includeOutputs": False},
-                      port).get("cells", [])
-    title = code.splitlines()[0] if code else ""
-    existing = next((c for c in cells if "".join(c.get("source") or []).splitlines()[:1] == [title]), None)
-    if existing:
-        cell_id = existing["id"]
-        call_tool("update_cell", {"cellId": cell_id, "content": code}, port)
-    else:
-        cell_id = call_tool("add_code_cell", {"cellIndex": len(cells), "language": "python", "code": code},
-                            port)["newCellId"]
-    result = call_tool("run_code_cell", {"cellId": cell_id}, port)
-    return output_text(result.get("outputs") if isinstance(result, dict) else [])
+def run(code: str, port: int = None, project: str = None, expect_host: str = None, timeout: float = 900) -> dict:
+    """Runs code as a notebook cell and returns {"output": what it printed, "runtime": {"host", "gpu"}}. The bridge runs
+    one cell at a time, titles it with the project's name, and refuses to run it on another runtime than expect_host
+    (by default the one this bridge's claims are on). A cell whose first line is the same (a title comment such as
+    `# my probe`) is updated and run again instead of adding another."""
+    port = port or default_port()
+    req = {"op": "run", "code": code, "project": project}
+    if expect_host:
+        req["expect_host"] = expect_host
+    try:
+        return request(req, port, timeout)
+    except BridgeError as e:
+        if "unknown op run" not in str(e):
+            raise
+    # A bridge from before the run request: the same steps from here, without its one-at-a-time lock.
+    result = notebook.drive(notebook.run_flow(code, project, port, expect_host),
+                            lambda name, args: call_tool(name, args, port))
+    if result["moved"]:
+        print(f"colab-bridge: {result['moved']}", file=sys.stderr)
+    if result["elsewhere"]:
+        raise BridgeError(result["elsewhere"])
+    return {"output": result["output"], "runtime": result["runtime"]}
+
+
+def run_cell(code: str, port: int = None, project: str = None, expect_host: str = None, timeout: float = 900) -> str:
+    """What code printed when run as a notebook cell (see run)."""
+    return run(code, port, project, expect_host, timeout)["output"]
 
 
 def with_env(code: str, env: dict, filename: str = "cell.py") -> str:
@@ -122,7 +128,7 @@ print(os.path.getsize({path!r}), hashlib.sha256(data).hexdigest(), base64.b64enc
 """
 
 
-def fetch(remote: str, local: str, port: int = None, progress=None) -> int:
+def fetch(remote: str, local: str, port: int = None, progress=None, project: str = None) -> int:
     """Copies a file from the Colab runtime to local in parts read by notebook cells, each checked with SHA-256; the
     local file appears only when every part arrived. Returns its size. progress(done, total) is called per part."""
     part = local + ".part"
@@ -130,7 +136,8 @@ def fetch(remote: str, local: str, port: int = None, progress=None) -> int:
     try:
         with open(part, "wb") as f:
             while total is None or offset < total:
-                output = run_cell(FETCH_CELL.format(path=remote, offset=offset, size=FETCH_PART_BYTES), port)
+                output = run_cell(FETCH_CELL.format(path=remote, offset=offset, size=FETCH_PART_BYTES), port,
+                                  project)
                 # "size sha256 base64" on the last line; an empty part leaves the base64 field empty.
                 lines = output.strip("\n").splitlines()
                 fields = lines[-1].split(" ") if lines else []
