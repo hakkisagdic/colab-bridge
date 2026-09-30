@@ -1,7 +1,9 @@
 """
 colab-bridge: keep a Google Colab tab connected to this machine and drive its notebook from scripts.
 
-  colab-bridge start                 run the bridge in the background (the Colab link of an earlier run keeps working)
+  colab-bridge start [--open]        run the bridge in the background (the Colab link of an earlier run keeps working)
+  colab-bridge open                  open the link in colab-bridge's own Chrome, which keeps the tab at full speed
+                                     while it is hidden (sign in to Google there once)
   colab-bridge link                  print the link to open in the Colab tab
   colab-bridge status                is a Colab tab connected?
   colab-bridge run FILE.py [--env NAME=VALUE ...]
@@ -36,7 +38,7 @@ import subprocess
 import sys
 import time
 
-from colab_bridge import client, registry, server
+from colab_bridge import browser, client, registry, server
 
 PROBE_CELL = """# colab-bridge: runtime probe
 import json, socket, subprocess
@@ -98,7 +100,7 @@ def cmd_start(args):
         link = read_link(args.dir)
         if link:
             print(link)
-        return 0
+        return cmd_open(args) if args.open and link else 0
     os.makedirs(args.dir, exist_ok=True)
     command = [sys.executable, "-m", "colab_bridge", "--port", str(args.port), "--dir", args.dir, "serve",
                "--idle-reminder", str(args.idle_reminder)]
@@ -115,8 +117,25 @@ def cmd_start(args):
     if not port_open(args.port):
         print(f"The bridge did not start; see {os.path.join(args.dir, 'bridge.out')}.", file=sys.stderr)
         return 1
-    print(f"Bridge running on 127.0.0.1:{args.port}. Open this link in the Colab tab (paste it, do not reload):")
+    print(f"Bridge running on 127.0.0.1:{args.port}. Open this link in the Colab tab (paste it, do not reload), or "
+          "open it with `colab-bridge open`:")
     print(read_link(args.dir))
+    return cmd_open(args) if args.open else 0
+
+
+def cmd_open(args):
+    link = read_link(args.dir)
+    if not link:
+        print(f"No link in {args.dir} yet: run `colab-bridge start`.", file=sys.stderr)
+        return 1
+    try:
+        browser.open_link(link, args.chrome, args.profile)
+    except (FileNotFoundError, OSError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    print(f"Opened the Colab link in colab-bridge's own Chrome ({args.profile or browser.DEFAULT_PROFILE}), which keeps "
+          "the tab at full speed while it is hidden. The first time, sign in to Google in that window; then connect a "
+          "runtime (for example a GPU) in the tab. Close any older tab of this bridge.")
     return 0
 
 
@@ -323,12 +342,25 @@ def main(argv=None) -> int:
                              help="shell command for notices, with the message in COLAB_BRIDGE_MESSAGE (default: "
                                   "COLAB_BRIDGE_NOTIFY, else a desktop notification on macOS)")
 
+    def open_options(command):
+        command.add_argument("--chrome", default=None, metavar="PATH",
+                             help="Chrome or Chromium to open the link with (default: COLAB_BRIDGE_CHROME, the installed "
+                                  "Google Chrome, or one on PATH)")
+        command.add_argument("--profile", default=None, metavar="DIR",
+                             help=f"its profile (default: {browser.DEFAULT_PROFILE})")
+
     for name, function in (("serve", cmd_serve), ("start", cmd_start), ("restart", cmd_restart)):
         command = sub.add_parser(name)
         command.add_argument("--new-link", action="store_true",
                              help="make a new token and WebSocket port instead of reusing the earlier link")
         bridge_options(command)
+        if name != "serve":
+            command.add_argument("--open", action="store_true", help="then open the link as `colab-bridge open` does")
+            open_options(command)
         command.set_defaults(fn=function)
+    open_command = sub.add_parser("open", help="open the link in colab-bridge's own Chrome, unthrottled")
+    open_options(open_command)
+    open_command.set_defaults(fn=cmd_open)
     for name, function in (("stop", cmd_stop), ("link", cmd_link), ("status", cmd_status), ("tools", cmd_tools),
                            ("release", cmd_release)):
         command = sub.add_parser(name)

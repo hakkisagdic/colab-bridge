@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from colab_bridge import cli, client, notebook, registry, server
+from colab_bridge import browser, cli, client, notebook, registry, server
 
 
 class FakeNotebook:
@@ -304,3 +304,34 @@ def test_duration_seconds():
     assert cli.duration_seconds("1h30m") == 5400 and cli.duration_seconds("45") == 2700
     with pytest.raises(Exception):
         cli.duration_seconds("soon")
+
+
+def test_fetch_warns_when_the_copy_crawls(bridge, tmp_path, monkeypatch):
+    monkeypatch.setattr(client, "FETCH_PART_BYTES", 2000)
+    monkeypatch.setattr(client, "SLOW_PART_BYTES", 1000)
+    remote = tmp_path / "remote.bin"
+    remote.write_bytes(os.urandom(5000))
+    bridge.tab.delay = 0.3  # each part takes 0.3 s: about 7 KB/s, as in a hidden Chrome tab
+    warnings = []
+    assert client.fetch(str(remote), str(tmp_path / "local.bin"), bridge.port, warn=warnings.append) == 5000
+    assert len(warnings) == 1 and "KB/s" in warnings[0] and "colab-bridge open" in warnings[0], warnings
+
+
+def test_open_uses_a_chrome_of_its_own(tmp_path, monkeypatch, capsys):
+    record = tmp_path / "chrome-args.txt"
+    chrome = tmp_path / "chrome"
+    chrome.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {record}\n")
+    chrome.chmod(0o755)
+    base = ["--port", "8799", "--dir", str(tmp_path)]
+    assert cli.main(base + ["open", "--chrome", str(chrome)]) == 1, "no link yet"
+    link = "https://colab.research.google.com/notebooks/empty.ipynb#mcpProxyToken=t&mcpProxyPort=1"
+    (tmp_path / "link.txt").write_text(link + "\n")
+    assert cli.main(base + ["open", "--chrome", str(chrome), "--profile", str(tmp_path / "profile")]) == 0
+    deadline = time.time() + 10
+    while time.time() < deadline and not (record.exists() and link in record.read_text()):
+        time.sleep(0.05)
+    args = record.read_text().splitlines()
+    assert args[0] == f"--user-data-dir={tmp_path / 'profile'}" and args[-2:] == ["--new-window", link], args
+    assert all(flag in args for flag in browser.UNTHROTTLED), args
+    monkeypatch.setenv("COLAB_BRIDGE_CHROME", "/opt/chrome")
+    assert browser.find_chrome() == "/opt/chrome" and browser.find_chrome("/x/chrome") == "/x/chrome"

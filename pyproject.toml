@@ -1,6 +1,6 @@
 [project]
 name = "colab-bridge"
-version = "0.2.0"
+version = "0.3.0"
 description = "Keep a Google Colab tab connected to your machine and drive its notebook from scripts: run cells, fetch files."
 readme = "README.md"
 license = "MIT"

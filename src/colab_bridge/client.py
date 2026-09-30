@@ -16,12 +16,19 @@ import json
 import os
 import socket
 import sys
+import time
 
 from colab_bridge import notebook
 from colab_bridge.notebook import output_text  # noqa: F401 (part of this module's interface)
 
 DEFAULT_PORT = 8765
 FETCH_PART_BYTES = 4 << 20  # base64 makes a part about 5.6 MB of cell output
+# A part this big that comes slower than this means Chrome throttles the hidden Colab tab.
+SLOW_PART_BYTES = 256 << 10
+SLOW_BYTES_PER_S = 100_000
+SLOW_HINT = ("colab-bridge: this copy runs at {rate:.0f} KB/s. Chrome slows down a Colab tab it hides (a background "
+             "tab, a minimized or covered window): bring the tab to the front, or open the link with "
+             "`colab-bridge open`, whose window keeps its speed.")
 
 
 class BridgeError(RuntimeError):
@@ -128,16 +135,20 @@ print(os.path.getsize({path!r}), hashlib.sha256(data).hexdigest(), base64.b64enc
 """
 
 
-def fetch(remote: str, local: str, port: int = None, progress=None, project: str = None) -> int:
+def fetch(remote: str, local: str, port: int = None, progress=None, project: str = None, warn=None) -> int:
     """Copies a file from the Colab runtime to local in parts read by notebook cells, each checked with SHA-256; the
-    local file appears only when every part arrived. Returns its size. progress(done, total) is called per part."""
+    local file appears only when every part arrived. Returns its size. progress(done, total) is called per part, and
+    warn(message) once when the copy crawls (by default, on stderr)."""
+    warn = warn or (lambda message: print(message, file=sys.stderr, flush=True))
     part = local + ".part"
-    offset, total = 0, None
+    offset, total, warned = 0, None, False
     try:
         with open(part, "wb") as f:
             while total is None or offset < total:
+                started = time.monotonic()
                 output = run_cell(FETCH_CELL.format(path=remote, offset=offset, size=FETCH_PART_BYTES), port,
                                   project)
+                elapsed = max(time.monotonic() - started, 1e-6)
                 # "size sha256 base64" on the last line; an empty part leaves the base64 field empty.
                 lines = output.strip("\n").splitlines()
                 fields = lines[-1].split(" ") if lines else []
@@ -150,6 +161,9 @@ def fetch(remote: str, local: str, port: int = None, progress=None, project: str
                     raise BridgeError(f"{remote} changed while it was copied; fetch it again.")
                 f.write(data)
                 offset += len(data)
+                if not warned and len(data) >= SLOW_PART_BYTES and len(data) / elapsed < SLOW_BYTES_PER_S:
+                    warn(SLOW_HINT.format(rate=len(data) / elapsed / 1000))
+                    warned = True
                 if progress:
                     progress(offset, total)
         os.replace(part, local)

@@ -30,6 +30,10 @@ colab-bridge start          # runs the bridge in the background and prints the C
 Paste the link into a Colab tab's address bar and press Enter; don't reload an open tab instead, since Colab drops the
 part after `#` once the page has loaded. Then connect a runtime (for example a GPU) in that tab.
 
+Or let the bridge open it: `colab-bridge open` (or `colab-bridge start --open`) opens the link in a Chrome of the
+bridge's own, which keeps the tab at full speed while it is hidden (see [Hidden tabs](#hidden-tabs)). Sign in to Google
+in that window the first time.
+
 ```bash
 colab-bridge status                           # {"connected": true, "error": null}
 colab-bridge run cell.py                      # runs cell.py as a notebook cell, prints its output
@@ -105,6 +109,19 @@ colab-bridge start --idle-reminder 20 --notify-command 'curl -s -d "$COLAB_BRIDG
 The bridge learns about a runtime only from the cells it runs, and never runs a cell just to look: a cell would count as
 use, and keep the runtime from timing out on its own.
 
+## Hidden tabs
+
+Chrome slows down pages it considers hidden: a background tab, a minimized window, or one covered by other windows.
+After a few minutes their timers fire at most once a minute, and their renderer gets less of the CPU. A Colab tab that a
+bridge drives is hidden most of the time, so its cells answer late and `fetch` falls to a few KB/s; `fetch` says so when
+it happens. It may also be why Colab moves an idle tab to a new runtime.
+
+`colab-bridge open` avoids that. It opens the link in a separate Chrome profile (`~/.cache/colab-bridge/chrome`, or
+`--profile DIR`; `--chrome PATH` picks another Chrome or Chromium) started with `--disable-background-timer-throttling`,
+`--disable-renderer-backgrounding`, `--disable-backgrounding-occluded-windows` and without intensive wake-up throttling.
+Your everyday Chrome and its profile are left alone. Without it, keep the Colab tab visible while cells run and files
+copy.
+
 ## From Python
 
 ```python
@@ -127,6 +144,8 @@ before it.
 - The control socket listens on 127.0.0.1 without a password, so every program of this machine's users can use a
   running bridge.
 - The bridge only relays the notebook's tool calls; your Google sign-in stays in the browser.
+- `colab-bridge open` passes the link to Chrome on its command line, where other users of this machine can read it in
+  the process list. On a machine you share, paste the link into the tab instead.
 
 ## Limits
 
@@ -135,8 +154,8 @@ before it.
 - Claims, runtime checks and reminders cover what goes through colab-bridge on this machine. They do not see other
   machines, or cells run by hand in the tab.
 - The record is locked with `flock`, so it needs macOS or Linux.
-- `fetch` moves files through cell output in 4 MB parts (a few MB/s), each checked with SHA-256: fine for results,
-  not for datasets.
+- `fetch` moves files through cell output in 4 MB parts (a few MB/s while Chrome keeps the tab at speed), each checked
+  with SHA-256: fine for results, not for datasets.
 
 ## License
 
