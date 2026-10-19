@@ -9,10 +9,14 @@ lock:
   claims   {"project", "host", "gpu", "bridge", "vram_gb", "note", "since", "until"}: who uses which runtime, with how much
            GPU memory, until when. Advisory: nothing stops a cell from using more, but a claim that does not fit next to
            the others is refused, and `who` shows them all.
-  bridges  port -> {"host", "last_run", "last_project"}: the runtime each bridge's tab ran its last cell on.
+  bridges  port -> {"host", "last_run", "last_project", "cells"}: the runtime each bridge's tab ran its last cell on, and
+           the ids of the cells its notebook held then.
   hosts    host -> {"gpu", "last_run", "last_project", "last_bridge", "reminded"}: every runtime seen until it is released
-           or forgotten, so one that Colab moved a tab away from is still remembered, and reminded about, while it
-           may still be running.
+           or forgotten. When a bridge's cell runs on another runtime than its last, the notebook's cells tell why: the
+           same notebook means it changed runtime (Runtime > Change runtime type, or Colab gave it a new one), and Colab
+           released the old one, which is forgotten there and then; a new notebook (the link opened in another tab) may
+           have left the old runtime running in the first tab, which is noticed once, then. A runtime no bridge's tab is
+           on is not reminded about, and is forgotten a day after its last cell, by when Colab has ended it.
 """
 
 import contextlib
@@ -23,6 +27,8 @@ import time
 
 REGISTRY_ENV = "COLAB_BRIDGE_REGISTRY"
 KEEP_ENDED_CLAIMS_S = 6 * 3600  # ended claims still count as the runtime's last use when reminding
+RUNTIME_LIFE_S = 24 * 3600  # Colab ends every runtime within a day (Pro+'s longest): one left that long is gone
+KEEP_CELL_IDS = 500  # the notebook's cell ids kept per bridge, to tell its notebook from another
 
 
 class ClaimError(RuntimeError):
@@ -133,42 +139,51 @@ def expected_host(data: dict, bridge, now: float):
     return mine[-1]["host"] if mine else None
 
 
-def note_run(data: dict, bridge, project: str, runtime: dict, now: float):
-    """Records that a cell ran on runtime through bridge. Returns the earlier runtime when Colab moved the tab away from
-    a GPU runtime, which may still be running and using compute units; else None."""
+def note_run(data: dict, bridge, project: str, runtime: dict, now: float, cells: list = None):
+    """Records that a cell ran on runtime through bridge, in a notebook holding the cells with these ids (None when not
+    known). When the earlier runtime was another one, the notebook tells what happened to it: if the bridge's notebook is
+    the same (a cell id in common), the notebook changed runtime and Colab released the old one, which is forgotten. Else
+    returns the earlier runtime when it has a GPU, which may still be running in another tab and using compute units;
+    else None."""
     host = runtime["host"]
     record = data["bridges"].setdefault(str(bridge), {})
     earlier = record.get("host")
     moved = None
-    if earlier and earlier != host and data["hosts"].get(earlier, {}).get("gpu"):
-        moved = {"host": earlier, "gpu": data["hosts"][earlier]["gpu"]}
+    if earlier and earlier != host:
+        if cells and set(cells) & set(record.get("cells") or []):
+            forget(data, earlier)
+        elif data["hosts"].get(earlier, {}).get("gpu"):
+            moved = {"host": earlier, "gpu": data["hosts"][earlier]["gpu"]}
     record.update(host=host, last_run=now, last_project=project)
+    if cells is not None:
+        record["cells"] = list(cells)[-KEEP_CELL_IDS:]
     seen = data["hosts"].setdefault(host, {})
     seen.update(gpu=runtime.get("gpu"), last_run=now, last_project=project, last_bridge=str(bridge))
     return moved
 
 
 def idle_reminders(data: dict, now: float, idle_s: float) -> list:
-    """Reminders for runtimes that ran no cell for idle_s and that no project claims, at most one per runtime every
-    idle_s (the registry records when); returns the messages."""
+    """Reminders for runtimes a bridge's tab is on that ran no cell for idle_s and that no project claims, at most one
+    per runtime every idle_s (the registry records when); returns the messages. A runtime no bridge's tab is on any more
+    is not reminded about (it was noticed when the tab moved, see note_run) and is forgotten a day after its last cell."""
     prune(data, now)
     messages = []
-    for host, seen in data["hosts"].items():
+    for host, seen in list(data["hosts"].items()):
         if any(c["host"] == host for c in active(data["claims"], now)):
+            continue
+        if not any(b.get("host") == host for b in data["bridges"].values()):
+            if now - (seen.get("last_run") or 0) >= RUNTIME_LIFE_S:
+                forget(data, host)
             continue
         last = max([seen.get("last_run") or 0] + [c["until"] for c in data["claims"] if c["host"] == host])
         if now - last < idle_s or now - (seen.get("reminded") or 0) < idle_s:
             continue
         seen["reminded"] = now
         machine = f"{host} ({seen.get('gpu') or 'no GPU'})"
-        ports = sorted(p for p, b in data["bridges"].items() if b.get("host") == host)
-        if ports:
-            how = (f"If nothing runs there any more, release it: colab-bridge --port {ports[0]} release-runtime. If a "
-                   "background job still runs there, claim it (colab-bridge claim --for 2h NOTE). If it is already "
-                   f"gone: colab-bridge forget {host}.")
-        else:
-            how = ("Colab has moved the tab to another runtime since. If nothing runs there, end it under Runtime > "
-                   f"Manage sessions in the Colab tab, then run: colab-bridge forget {host}.")
+        port = min(p for p, b in data["bridges"].items() if b.get("host") == host)
+        how = (f"If nothing runs there any more, release it: colab-bridge --port {port} release-runtime. If a "
+               "background job still runs there, claim it (colab-bridge claim --for 2h NOTE). If it is already "
+               f"gone: colab-bridge forget {host}.")
         messages.append(f"Colab runtime {machine} has run no cell for {minutes(now - last)} and nobody claims it. {how}")
     return messages
 

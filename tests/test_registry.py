@@ -77,12 +77,37 @@ def test_claims_hold_off_reminders():
     assert len(registry.idle_reminders(data, NOW + 3600 + 1900, 1800)) == 1
 
 
-def test_a_runtime_left_behind_is_reminded_with_how_to_end_it():
+def test_a_notebook_that_changed_runtime_forgets_the_old_one():
+    # Runtime > Change runtime type in the bridge's tab: the same notebook (its cells) on a new runtime. Colab released
+    # the old one, so nothing is said about it and it leaves the record.
     data = empty()
-    registry.note_run(data, 8765, "alpha", {"host": "gpu", "gpu": "G"}, NOW)
-    registry.note_run(data, 8765, "alpha", {"host": "cpu", "gpu": None}, NOW + 1700)
-    messages = registry.idle_reminders(data, NOW + 1900, 1800)
-    assert len(messages) == 1 and "Manage sessions" in messages[0] and "colab-bridge forget gpu" in messages[0]
+    registry.note_run(data, 8765, "alpha", {"host": "h100", "gpu": "H100"}, NOW, cells=["a", "b"])
+    registry.claim(data, "alpha", "h100", 8765, NOW, 600)
+    assert registry.note_run(data, 8765, "alpha", {"host": "g4", "gpu": "RTX"}, NOW + 60, cells=["a", "b", "c"]) is None
+    assert set(data["hosts"]) == {"g4"} and data["claims"] == []
+    assert data["bridges"]["8765"]["cells"] == ["a", "b", "c"]
+
+
+def test_a_runtime_left_in_another_tab_is_noticed_once_then_forgotten_after_a_day():
+    # The link opened in another tab: a new notebook, so the first tab may still hold its runtime. That is said once,
+    # when it happens (note_run's answer), never reminded about, and the record lets it go a day after its last cell.
+    data = empty()
+    registry.note_run(data, 8765, "alpha", {"host": "h100", "gpu": "H100"}, NOW, cells=["a"])
+    left = registry.note_run(data, 8765, "alpha", {"host": "g4", "gpu": "RTX"}, NOW + 60, cells=["x"])
+    assert left == {"host": "h100", "gpu": "H100"}
+    # 2026-10-19: an H100 the tab had left 14.5 h before was reminded about every half hour, though it was long gone.
+    for hours in (0.5, 1, 14.5, 23.9):
+        assert all("h100" not in m for m in registry.idle_reminders(data, NOW + 60 + hours * 3600, 1800))
+    assert "h100" in data["hosts"]
+    registry.idle_reminders(data, NOW + 24 * 3600, 1800)
+    assert "h100" not in data["hosts"] and "g4" in data["hosts"]
+
+
+def test_runs_without_cell_ids_keep_the_old_notice():
+    # A client that does not say which cells the notebook holds (or a first run) cannot tell a notebook from another.
+    data = empty()
+    registry.note_run(data, 8765, "alpha", {"host": "h100", "gpu": "H100"}, NOW, cells=["a"])
+    assert registry.note_run(data, 8765, "alpha", {"host": "g4", "gpu": "RTX"}, NOW + 60) == {"host": "h100", "gpu": "H100"}
 
 
 def test_forget():

@@ -85,9 +85,11 @@ def split_runtime(output: str) -> tuple:
     return "".join(kept), runtime
 
 
-def run_steps(code: str, project: str = None, expected_host: str = None):
+def run_steps(code: str, project: str = None, expected_host: str = None, cell_ids: list = None):
     """The tool calls that run code as a cell, as a generator: it yields (tool, arguments), is sent each tool's result
-    and returns what the cell printed. A cell with the same title is updated and run again instead of adding one."""
+    and returns what the cell printed. A cell with the same title is updated and run again instead of adding one.
+    cell_ids, when given, gets the ids of the notebook's cells (the one run among them), which tell one notebook from
+    another (registry.note_run)."""
     source = cell_source(code, project, expected_host)
     title = source.partition("\n")[0]
     cells = (yield "get_cells", {"cellIndexStart": 0, "cellIndexEnd": 1000, "includeOutputs": False}).get("cells", [])
@@ -97,6 +99,8 @@ def run_steps(code: str, project: str = None, expected_host: str = None):
         yield "update_cell", {"cellId": cell_id, "content": source}
     else:
         cell_id = (yield "add_code_cell", {"cellIndex": len(cells), "language": "python", "code": source})["newCellId"]
+    if cell_ids is not None:
+        cell_ids.extend([c["id"] for c in cells if c.get("id")] + ([] if existing else [cell_id]))
     result = yield "run_code_cell", {"cellId": cell_id}
     return output_text(result.get("outputs") if isinstance(result, dict) else [])
 
@@ -109,16 +113,17 @@ def run_flow(code: str, project: str, bridge, expect_host: str = None):
     if expected is None:
         with registry.locked(write=False) as data:
             expected = registry.expected_host(data, bridge, time.time())
-    output, runtime = split_runtime((yield from run_steps(code, project, expected)))
+    cell_ids = []
+    output, runtime = split_runtime((yield from run_steps(code, project, expected, cell_ids)))
     moved = elsewhere = None
     if runtime:
         with registry.locked() as data:
-            left = registry.note_run(data, bridge, project, runtime, time.time())
+            left = registry.note_run(data, bridge, project, runtime, time.time(), cell_ids)
         if left:
-            moved = (f"Colab moved the tab of bridge {bridge} from runtime {left['host']} ({left['gpu']}) to "
-                     f"{runtime['host']} ({runtime.get('gpu') or 'no GPU'}). {left['host']} may still be running and "
-                     "using compute units: pick it again in the tab (Runtime > Change runtime type), or end it under "
-                     f"Runtime > Manage sessions and run: colab-bridge forget {left['host']}.")
+            moved = (f"The link of bridge {bridge} now runs in another notebook, on runtime {runtime['host']} "
+                     f"({runtime.get('gpu') or 'no GPU'}); its earlier runtime {left['host']} ({left['gpu']}) may still "
+                     "be running in the first tab and using compute units: if so, end it under Runtime > Manage "
+                     f"sessions. colab-bridge forgets {left['host']} by itself a day after its last cell.")
         if expected and runtime["host"] != expected:
             elsewhere = (f"Not run: the tab of bridge {bridge} now runs on {runtime['host']} "
                          f"({runtime.get('gpu') or 'no GPU'}), but the cell was meant for {expected}. Colab moves a tab "

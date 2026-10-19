@@ -94,9 +94,15 @@ runtime, while the GPU runtime your job is on keeps running. The bridge guards a
 
 ## Reminders against waste
 
-A running bridge reminds you of runtimes that ran no cell for 30 minutes and that no project claims, again every 30
-minutes until you release them (`release-runtime`), claim them for a background job, or `forget` them once they are
-gone. Bridges that share the record take turns, so each reminder comes once.
+A running bridge reminds you of runtimes its tab is on that ran no cell for 30 minutes and that no project claims,
+again every 30 minutes until you release them (`release-runtime`), claim them for a background job, or `forget` them
+once they are gone. Bridges that share the record take turns, so each reminder comes once.
+
+When a bridge's cell runs on another runtime than its last, the notebook's cells tell why. The same notebook means it
+changed runtime (Runtime > Change runtime type, or Colab gave it a new one): Colab released the old runtime, and the
+record drops it without a word. A new notebook means the link was opened in another tab, and the first tab may still
+hold its runtime: you hear that once, then. Either way a runtime no tab is on is not reminded about, and the record
+forgets it a day after its last cell, by when Colab has ended it.
 
 On macOS reminders are desktop notifications; anywhere, `--notify-command` (or `COLAB_BRIDGE_NOTIFY`) runs a command of
 yours with the message in `COLAB_BRIDGE_MESSAGE`, for example to send it to your phone. The bridge log has them all.

@@ -173,7 +173,17 @@ def test_moving_off_a_gpu_runtime_is_reported(bridge):
     with registry.locked() as data:
         registry.note_run(data, bridge.port, "alpha", {"host": "gpu-host", "gpu": "Big GPU"}, time.time())
     client.run_cell("# probe\nprint(1)", bridge.port, project="alpha")
-    assert len(bridge.notices) == 1 and "from runtime gpu-host (Big GPU)" in bridge.notices[0]
+    assert len(bridge.notices) == 1 and "earlier runtime gpu-host (Big GPU)" in bridge.notices[0]
+
+
+def test_a_notebook_that_changed_runtime_is_not_reported(bridge):
+    # The same notebook (the cell ids of the last run) on another runtime: Colab released the old one.
+    client.run_cell("# probe\nprint(1)", bridge.port, project="alpha")
+    with registry.locked() as data:
+        data["bridges"][str(bridge.port)]["host"] = "gpu-host"
+        data["hosts"]["gpu-host"] = {"gpu": "Big GPU", "last_run": time.time()}
+    client.run_cell("# probe\nprint(2)", bridge.port, project="alpha")
+    assert bridge.notices == [] and "gpu-host" not in registry.snapshot()["hosts"]
 
 
 def test_one_cell_runs_at_a_time(bridge):
