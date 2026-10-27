@@ -15,6 +15,18 @@ colab-bridge: keep a Google Colab tab connected to this machine and drive its no
   colab-bridge quota [--json]        the account's compute units: how many are left, how many an hour go, how long
                                      they last (read from the Colab tab in colab-bridge's own Chrome)
 
+Long work without holding the notebook, and messages from the runtime:
+  colab-bridge job start FILE [--name NAME] [--env NAME=VALUE ...] [--secret NAME ...] [--cwd DIR]
+                                     run a Python file (or a .sh script) on the runtime in a process of its own; the
+                                     cell that starts it returns at once
+  colab-bridge job status [NAME] [--lines N]
+                                     how the jobs do: running, ended (with the exit code) or lost; their logs' ends
+  colab-bridge job stop NAME [--kill]
+                                     end a job (TERM to its processes, or KILL)
+  colab-bridge events [--since 24h] [--level alert]
+                                     what processes on the runtime left in its outbox (/tmp/colab-bridge/outbox.jsonl);
+                                     every cell brings it here, into <dir>/events.jsonl
+
 Sharing a runtime between projects (tabs opened from bridge links share one runtime):
   colab-bridge claim [--vram GB] [--for 90m] [NOTE ...]
                                      tell the others you use the runtime, with how much GPU memory, for how long
@@ -40,7 +52,7 @@ import subprocess
 import sys
 import time
 
-from colab_bridge import browser, client, quota, registry, server
+from colab_bridge import browser, client, events, jobs, quota, registry, server
 
 PROBE_CELL = """# colab-bridge: runtime probe
 import json, socket, subprocess
@@ -183,16 +195,98 @@ def cmd_tools(args):
     return 0
 
 
+def env_pairs(items: list):
+    """--env NAME=VALUE values as a dict, or None when one is not NAME=VALUE."""
+    pairs = [item.split("=", 1) for item in items]
+    if any(len(pair) != 2 or not pair[0] for pair in pairs):
+        print("--env takes NAME=VALUE", file=sys.stderr)
+        return None
+    return dict(pairs)
+
+
 def cmd_run(args):
     with open(args.file, encoding="utf-8") as f:
         code = f.read()
     if args.env:
-        pairs = [item.split("=", 1) for item in args.env]
-        if any(len(pair) != 2 or not pair[0] for pair in pairs):
-            print("--env takes NAME=VALUE", file=sys.stderr)
+        env = env_pairs(args.env)
+        if env is None:
             return 2
-        code = client.with_env(code, dict(pairs), os.path.basename(args.file))
-    print(client.run_cell(code, args.port, args.project))
+        code = client.with_env(code, env, os.path.basename(args.file))
+    print(client.run_cell(code, args.port, args.project, state_dir=args.dir))
+    return 0
+
+
+def ago(seconds: float) -> str:
+    return registry.minutes(seconds) if seconds >= 60 else f"{max(seconds, 0):.0f} s"
+
+
+def cmd_job_start(args):
+    with open(args.file, encoding="utf-8") as f:
+        code = f.read()
+    env = env_pairs(args.env)
+    if env is None:
+        return 2
+    name = jobs.check_name(args.name) if args.name else jobs.name_for(args.file)
+    meta = jobs.start(code, name, args.port, args.project, env, args.secret, args.cwd, args.file.endswith(".sh"),
+                      args.dir)
+    if args.json:
+        print(json.dumps(meta))
+    else:
+        print(f"Started job {meta['name']} on {meta['host']} (pid {meta['pid']}), its log in {meta['log']}. "
+              f"See how it does with: colab-bridge job status {meta['name']}")
+    return 0
+
+
+def describe_job(job: dict, now: float) -> str:
+    started = job.get("started") or now
+    if job["state"] == "running":
+        how = f"running for {ago(now - started)}"
+    elif job["state"] == "ended":
+        code = job.get("exit")
+        how = ("stopped" if job.get("stopped") else "finished" if code == 0
+               else f"killed by signal {-code}" if isinstance(code, int) and code < 0 else f"failed (exit {code})")
+        how += f" {ago(now - (job.get('ended') or now))} ago, after {ago((job.get('ended') or now) - started)}"
+    else:
+        how = job["state"] + (": its supervisor is gone and said nothing" if job["state"] == "lost" else "")
+    project = f" [{job['project']}]" if job.get("project") else ""
+    return f"{job['name']}{project}: {how}" + (f" (pid {job['pid']})" if job["state"] == "running" else "")
+
+
+def cmd_job_status(args):
+    answer = jobs.status(args.name, args.port, args.project, args.lines, args.dir)
+    if args.json:
+        print(json.dumps(answer))
+        return 0
+    if not answer["jobs"]:
+        print(f"No job on {answer['host']}.")
+    now = time.time()
+    for job in answer["jobs"]:
+        print(describe_job(job, now))
+        for line in job.get("last") or []:
+            print(f"  {line}")
+    return 0 if all(j["state"] != "unknown" for j in answer["jobs"]) else 1
+
+
+def cmd_job_stop(args):
+    answer = jobs.stop(args.name, args.port, args.project, args.kill, args.dir)
+    if args.json:
+        print(json.dumps(answer))
+    else:
+        print(f"Job {answer['name']}: {answer['state']} ({answer['said']}).")
+    return 0
+
+
+def cmd_events(args):
+    found = [e for e in events.read(args.dir, time.time() - args.since)
+             if not args.level or e.get("level") == args.level]
+    for e in found:
+        if args.json:
+            print(json.dumps(e, ensure_ascii=False))
+        else:
+            source = f" ({e['source']})" if e.get("source") else ""
+            print(f"{registry.clock(e.get('t') or e['at'])} {e.get('host')} {e.get('level')}: {e.get('text')}{source}")
+    if not found and not args.json:
+        print("No events from the runtime in that time. They come with the cells sent through this bridge.")
     return 0
 
 
@@ -205,7 +299,7 @@ def cmd_fetch(args):
     def progress(done, total):
         print(f"\r{done / 1e6:.1f} of {total / 1e6:.1f} MB", end="", file=sys.stderr, flush=True)
 
-    total = client.fetch(args.remote, local, args.port, progress, args.project)
+    total = client.fetch(args.remote, local, args.port, progress, args.project, state_dir=args.dir)
     print(f"\n{local} ({total / 1e6:.1f} MB in {time.time() - started:.0f} s)")
     return 0
 
@@ -224,7 +318,7 @@ def duration_seconds(text: str) -> float:
 
 def probe(args) -> dict:
     """The runtime the bridge's tab is on: {"host", "gpu", "total_gb", "free_gb"}."""
-    output = client.run_cell(PROBE_CELL, args.port, args.project).strip()
+    output = client.run_cell(PROBE_CELL, args.port, args.project, state_dir=args.dir).strip()
     try:
         return json.loads(output.splitlines()[-1])
     except (IndexError, ValueError):
@@ -325,7 +419,8 @@ def cmd_release_runtime(args):
               + ". Agree with them first, or pass --force.", file=sys.stderr)
         return 1
     try:
-        output = client.run_cell(RELEASE_CELL, args.port, args.project, expect_host=host, timeout=180)
+        output = client.run_cell(RELEASE_CELL, args.port, args.project, expect_host=host, timeout=180,
+                                 state_dir=args.dir)
     except client.BridgeError as e:
         print(f"{e}\nThe runtime may not be released: look at the Colab tab. If {host} is gone, run: "
               f"colab-bridge forget {host}", file=sys.stderr)
@@ -428,10 +523,38 @@ def main(argv=None) -> int:
     forget = sub.add_parser("forget", help="drop a runtime that is gone from the record")
     forget.add_argument("host", nargs="?", help="its host name (default: the one this bridge's tab is on)")
     forget.set_defaults(fn=cmd_forget)
+    job = sub.add_parser("job", help="long work on the runtime in a process of its own, not in a cell")
+    job_sub = job.add_subparsers(dest="job_command", required=True)
+    job_start = job_sub.add_parser("start", help="start a Python file (or a .sh script) as a job")
+    job_start.add_argument("file")
+    job_start.add_argument("--name", help="the job's name (default: the file's), one job at a time under it")
+    job_start.add_argument("--env", action="append", default=[], metavar="NAME=VALUE",
+                           help="environment variable for the job (repeatable)")
+    job_start.add_argument("--secret", action="append", default=[], metavar="NAME",
+                           help="a notebook secret the job gets as an environment variable, read on the runtime "
+                                "(repeatable)")
+    job_start.add_argument("--cwd", help="where it runs (default: /content, else the home folder)")
+    job_start.add_argument("--json", action="store_true")
+    job_start.set_defaults(fn=cmd_job_start)
+    job_status = job_sub.add_parser("status", help="how one job, or every job, does")
+    job_status.add_argument("name", nargs="?")
+    job_status.add_argument("--lines", type=int, default=5, help="lines of each log's end (default: 5)")
+    job_status.add_argument("--json", action="store_true")
+    job_status.set_defaults(fn=cmd_job_status)
+    job_stop = job_sub.add_parser("stop", help="end a job")
+    job_stop.add_argument("name")
+    job_stop.add_argument("--kill", action="store_true", help="KILL instead of TERM")
+    job_stop.add_argument("--json", action="store_true")
+    job_stop.set_defaults(fn=cmd_job_stop)
+    events_command = sub.add_parser("events", help="what processes on the runtime left for this machine")
+    events_command.add_argument("--since", type=duration_seconds, default=duration_seconds("24h"), metavar="DURATION",
+                                help="how far back: 30m, 2h (default: 24h)")
+    events_command.add_argument("--level", help="only these: alert, info, ...")
+    events_command.add_argument("--json", action="store_true", help="one JSON object a line")
+    events_command.set_defaults(fn=cmd_events)
 
     args = parser.parse_args(argv)
-    args.dir = os.path.expanduser(args.dir or os.environ.get("COLAB_BRIDGE_DIR")
-                                  or f"~/.cache/colab-bridge/{args.port}")
+    args.dir = os.path.expanduser(args.dir) if args.dir else client.default_dir(args.port)
     args.project = args.project or os.environ.get("COLAB_BRIDGE_PROJECT") or os.path.basename(os.getcwd()) or "default"
     try:
         return args.fn(args)

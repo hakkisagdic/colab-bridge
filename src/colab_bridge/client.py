@@ -8,6 +8,9 @@ The bridge listens on 127.0.0.1 and takes one JSON line per connection:
   {"op": "run", "code": CODE, "project": NAME}      -> {"output": str, "runtime": {"host", "gpu"}}: the code as a cell,
                                                        one request at a time (colab_bridge.notebook.run_flow)
 Errors come back as {"ok": false, "error": "..."}.
+
+Every cell this client sends also brings the runtime's events home (colab_bridge.events): what processes there left in
+its outbox, kept in the bridge's folder.
 """
 
 import base64
@@ -18,7 +21,7 @@ import socket
 import sys
 import time
 
-from colab_bridge import notebook
+from colab_bridge import events, notebook
 from colab_bridge.notebook import output_text  # noqa: F401 (part of this module's interface)
 
 DEFAULT_PORT = 8765
@@ -37,6 +40,12 @@ class BridgeError(RuntimeError):
 
 def default_port() -> int:
     return int(os.environ.get("COLAB_BRIDGE_PORT") or DEFAULT_PORT)
+
+
+def default_dir(port: int = None) -> str:
+    """The bridge's folder: its link, log and process id, and the runtime's events (COLAB_BRIDGE_DIR, else
+    ~/.cache/colab-bridge/<port>)."""
+    return os.path.expanduser(os.environ.get("COLAB_BRIDGE_DIR") or f"~/.cache/colab-bridge/{port or default_port()}")
 
 
 def request(req: dict, port: int = None, timeout: float = 900) -> object:
@@ -79,33 +88,45 @@ def call_tool(name: str, args: dict, port: int = None):
     return tool_value(name, request({"op": "call", "name": name, "args": args}, port))
 
 
-def run(code: str, port: int = None, project: str = None, expect_host: str = None, timeout: float = 900) -> dict:
-    """Runs code as a notebook cell and returns {"output": what it printed, "runtime": {"host", "gpu"}}. The bridge runs
-    one cell at a time, titles it with the project's name, and refuses to run it on another runtime than expect_host
-    (by default the one this bridge's claims are on). A cell whose first line is the same (a title comment such as
-    `# my probe`) is updated and run again instead of adding another."""
+def run(code: str, port: int = None, project: str = None, expect_host: str = None, timeout: float = 900,
+        state_dir: str = None) -> dict:
+    """Runs code as a notebook cell and returns {"output": what it printed, "runtime": {"host", "gpu"}, "events": the
+    runtime's events this cell brought}. The bridge runs one cell at a time, titles it with the project's name, and
+    refuses to run it on another runtime than expect_host (by default the one this bridge's claims are on). A cell whose
+    first line is the same (a title comment such as `# my probe`) is updated and run again instead of adding another.
+    The events are kept in state_dir, the bridge's folder (default_dir)."""
     port = port or default_port()
-    req = {"op": "run", "code": code, "project": project}
+    state_dir = state_dir or default_dir(port)
+    sent = events.with_drain(code, events.offsets(state_dir))
+    req = {"op": "run", "code": sent, "project": project}
     if expect_host:
         req["expect_host"] = expect_host
     try:
-        return request(req, port, timeout)
+        result = request(req, port, timeout)
     except BridgeError as e:
         if "unknown op run" not in str(e):
             raise
-    # A bridge from before the run request: the same steps from here, without its one-at-a-time lock.
-    result = notebook.drive(notebook.run_flow(code, project, port, expect_host),
-                            lambda name, args: call_tool(name, args, port))
-    if result["moved"]:
-        print(f"colab-bridge: {result['moved']}", file=sys.stderr)
-    if result["elsewhere"]:
-        raise BridgeError(result["elsewhere"])
-    return {"output": result["output"], "runtime": result["runtime"]}
+        # A bridge from before the run request: the same steps from here, without its one-at-a-time lock.
+        flow = notebook.drive(notebook.run_flow(sent, project, port, expect_host),
+                              lambda name, args: call_tool(name, args, port))
+        if flow["moved"]:
+            print(f"colab-bridge: {flow['moved']}", file=sys.stderr)
+        if flow["elsewhere"]:
+            raise BridgeError(flow["elsewhere"])
+        result = {"output": flow["output"], "runtime": flow["runtime"]}
+    result["output"], drained = events.split(result["output"])
+    try:
+        result["events"] = events.record(state_dir, drained)
+    except OSError as e:  # the cell ran: its answer counts more; the lines come again with the next cell
+        print(f"colab-bridge: the runtime's events were not kept in {state_dir}: {e}", file=sys.stderr)
+        result["events"] = []
+    return result
 
 
-def run_cell(code: str, port: int = None, project: str = None, expect_host: str = None, timeout: float = 900) -> str:
+def run_cell(code: str, port: int = None, project: str = None, expect_host: str = None, timeout: float = 900,
+             state_dir: str = None) -> str:
     """What code printed when run as a notebook cell (see run)."""
-    return run(code, port, project, expect_host, timeout)["output"]
+    return run(code, port, project, expect_host, timeout, state_dir)["output"]
 
 
 def with_env(code: str, env: dict, filename: str = "cell.py") -> str:
@@ -135,7 +156,8 @@ print(os.path.getsize({path!r}), hashlib.sha256(data).hexdigest(), base64.b64enc
 """
 
 
-def fetch(remote: str, local: str, port: int = None, progress=None, project: str = None, warn=None) -> int:
+def fetch(remote: str, local: str, port: int = None, progress=None, project: str = None, warn=None,
+          state_dir: str = None) -> int:
     """Copies a file from the Colab runtime to local in parts read by notebook cells, each checked with SHA-256; the
     local file appears only when every part arrived. Returns its size. progress(done, total) is called per part, and
     warn(message) once when the copy crawls (by default, on stderr)."""
@@ -147,7 +169,7 @@ def fetch(remote: str, local: str, port: int = None, progress=None, project: str
             while total is None or offset < total:
                 started = time.monotonic()
                 output = run_cell(FETCH_CELL.format(path=remote, offset=offset, size=FETCH_PART_BYTES), port,
-                                  project)
+                                  project, state_dir=state_dir)
                 elapsed = max(time.monotonic() - started, 1e-6)
                 # "size sha256 base64" on the last line; an empty part leaves the base64 field empty.
                 lines = output.strip("\n").splitlines()

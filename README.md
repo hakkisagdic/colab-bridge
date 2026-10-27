@@ -46,8 +46,8 @@ colab-bridge stop
 A file whose first line is a comment such as `# my probe` reuses the notebook cell with that first line instead of
 adding a new one each time.
 
-A cell blocks the notebook while it runs, so start long jobs in the background from a cell
-(`subprocess.Popen(..., start_new_session=True)`, output to a log file) and check them with short cells.
+A cell blocks the notebook while it runs, and the bridge runs one cell at a time, so a long cell makes every other cell
+wait behind it: run long work as a [job](#jobs) instead.
 
 ## Several projects on one runtime
 
@@ -133,6 +133,53 @@ an estimate. The bridge asks for the numbers the way Colab's own Resources panel
 sign-in, through Chrome's debugging port on 127.0.0.1 (9765, or `--debug-port` / `COLAB_BRIDGE_DEBUG_PORT`). If Colab
 moves them, `quota` lists the requests the page itself made, to find where they went.
 
+## Jobs
+
+A job is long work started by a short cell: the file goes to the runtime and runs there in a process of its own, its
+output in a log, while the notebook is free for other cells at once. Later short cells say how it does, or stop it.
+
+```bash
+colab-bridge job start ship.py --name ship --env DAY=27 --secret HF_TOKEN
+colab-bridge job status ship        # running for 4 min (pid 4242), and its log's last lines
+colab-bridge job status             # every job on the runtime: running, ended (with its exit code) or lost
+colab-bridge job stop ship          # TERM to the job and its own processes; --kill for KILL
+```
+
+A `.sh` file runs with bash, anything else with the kernel's Python. A job gets the kernel's environment, the `--env`
+values, and the notebook secrets named with `--secret`, read on the runtime and never printed (`google.colab.userdata`
+only answers inside the notebook, where a detached process cannot ask). It runs in `/content` unless `--cwd` says
+otherwise. One job runs under a name at a time; starting the name again once it ended replaces its folder,
+`/tmp/colab-bridge/jobs/<name>` (the file, `meta.json`, `log`, and `exit.json` once it ended). When a job ends it says so
+in the runtime's outbox (below): `job ship finished after 12 min; its log ends: ...`, as an alert when it failed or was
+killed.
+
+## Events from the runtime
+
+Processes on the runtime can leave short messages for this machine, which come here without a cell of their own. The
+runtime cannot reach this machine, and the bridge never runs a cell just to look; instead a process appends a line to
+the runtime's outbox, `/tmp/colab-bridge/outbox.jsonl`:
+
+```bash
+echo '{"level": "alert", "text": "the trainer died (exit 1)", "source": "watch"}' >> /tmp/colab-bridge/outbox.jsonl
+echo "plain text is information" >> /tmp/colab-bridge/outbox.jsonl
+```
+
+Every cell a colab-bridge client sends (`run`, `fetch`, jobs) begins with one line of code that prints what this machine
+has not had of the outbox yet; the client takes those lines out of the cell's output and keeps them in the bridge's
+folder, `~/.cache/colab-bridge/<port>/events.jsonl`, one JSON object a line: `{"at", "host", "level", "text",
+"source", "t"}` (`t`: when the runtime said it, if the line had it). A message arrives with the next cell through the
+bridge, whoever sends it.
+
+```bash
+colab-bridge events                 # the last day's
+colab-bridge events --level alert --since 2h --json
+```
+
+Where this machine got to in each runtime's outbox is kept beside them (`events-cursor.json`), and only a client that
+kept the lines moves it: a cell whose answer never came back leaves them for the next cell, and two cells that read the
+same lines keep them once. A line still being written waits for its end. The outbox is append-only (a runtime lives a
+day at most); `"level"` is yours to choose, and `"alert"` is the one meant for a person.
+
 ## Hidden tabs
 
 Chrome slows down pages it considers hidden: a background tab, a minimized window, or one covered by other windows.
@@ -153,6 +200,12 @@ from colab_bridge import client
 
 print(client.run_cell("# probe\nimport torch; print(torch.cuda.get_device_name(0))", port=8765, project="demo"))
 client.fetch("/content/result.mp4", "result.mp4", port=8765, project="demo")
+
+from colab_bridge import events, jobs
+
+jobs.start(open("train.py").read(), "train", port=8765, project="demo")
+print(jobs.status("train", port=8765)["jobs"][0]["state"])
+print(events.read(client.default_dir(8765)))  # what the runtime's outbox said, as it came with the cells
 ```
 
 `colab_bridge.client` uses only the standard library. The control protocol is one JSON line per connection to
@@ -183,6 +236,8 @@ before it.
 - The record is locked with `flock`, so it needs macOS or Linux.
 - `fetch` moves files through cell output in 4 MB parts (a few MB/s while Chrome keeps the tab at speed), each checked
   with SHA-256: fine for results, not for datasets.
+- The runtime's events come with cells: while no cell runs through a bridge, they wait in the outbox. A cell brings
+  at most 200 lines of it; the rest come with the next.
 
 ## License
 
