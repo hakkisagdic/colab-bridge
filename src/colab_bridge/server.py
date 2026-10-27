@@ -11,7 +11,9 @@ agent in the loop.
 
 Several projects can share a bridge, and several bridges a runtime (colab_bridge.registry): the bridge runs one cell at
 a time, stops cells that would land on another runtime than their claims, tells the person at this machine when Colab
-moves the tab away from a GPU runtime, and reminds them of runtimes that sit idle with nobody claiming them.
+moves the tab away from a GPU runtime, and reminds them of runtimes that sit idle with nobody claiming them. Every 15
+minutes it reads the account's compute units from the Colab tab when that tab is in colab-bridge's own Chrome
+(colab_bridge.quota), and warns when they would last less than a day.
 
 The Colab link carries a token: whoever holds it can run code in that runtime. The control socket listens on 127.0.0.1
 only and has no password, so every program of this machine's users can use a running bridge.
@@ -28,7 +30,7 @@ import subprocess
 import sys
 import time
 
-from colab_bridge import notebook, registry
+from colab_bridge import notebook, quota, registry
 from colab_bridge.client import tool_value
 
 LINK_FILE = "link.txt"
@@ -37,6 +39,8 @@ LOG_FILE = "bridge.log"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024  # notebook tool answers carry whole cells; websockets' 1 MiB default is too small
 IDLE_MINUTES = 30  # remind about a runtime that ran no cell and had no claim for this long; 0 turns reminders off
 IDLE_CHECK_S = 60
+QUOTA_CHECK_S = 15 * 60
+QUOTA_FLOOR_H = 24  # warn when the compute units would last less than this at the current rate
 
 
 def free_dual_stack_port() -> int:
@@ -135,6 +139,32 @@ async def remind_idle(idle_minutes: float, alert):
             logging.exception("the idle check failed")
 
 
+async def watch_quota(alert, every_s: float = QUOTA_CHECK_S, floor_h: float = QUOTA_FLOOR_H):
+    """Every every_s, reads the account's compute units from the Colab tab in colab-bridge's Chrome into the registry,
+    and warns (quota.warning) while they would last less than floor_h. Without that Chrome it warns from the latest
+    reading carried forward; bridges sharing a registry take turns through it, so each warning comes once."""
+    unreadable = None
+    while True:
+        try:
+            reading = await asyncio.to_thread(quota.read)
+            unreadable = None
+        except quota.QuotaError as e:
+            reading = None
+            if str(e) != unreadable:  # once per kind of failure, not every round
+                logging.info("compute units not read: %s", e)
+                unreadable = str(e)
+        try:
+            with registry.locked() as data:
+                if reading:
+                    data["quota"]["reading"] = reading
+                message = quota.warning(data["quota"], time.time(), floor_h)
+            if message:
+                alert(message)
+        except Exception:
+            logging.exception("the compute-unit check failed")
+        await asyncio.sleep(every_s)
+
+
 async def serve(port: int, state_dir: str, token: str = None, ws_port: int = None,
                 idle_minutes: float = IDLE_MINUTES, notify_command: str = None):
     """Runs the bridge until it is stopped: writes the Colab link to <state_dir>/link.txt, waits for the tab and
@@ -193,6 +223,7 @@ async def serve(port: int, state_dir: str, token: str = None, ws_port: int = Non
         tasks = [asyncio.create_task(connect(wss))]  # held, so the loop does not drop them
         if idle_minutes:
             tasks.append(asyncio.create_task(remind_idle(idle_minutes, alert)))
+        tasks.append(asyncio.create_task(watch_quota(alert)))
         server = await asyncio.start_server(control_handler(state, alert), "127.0.0.1", port, limit=MAX_MESSAGE_BYTES)
         async with server:
             await server.serve_forever()

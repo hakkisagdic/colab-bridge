@@ -115,6 +115,24 @@ colab-bridge start --idle-reminder 20 --notify-command 'curl -s -d "$COLAB_BRIDG
 The bridge learns about a runtime only from the cells it runs, and never runs a cell just to look: a cell would count as
 use, and keep the runtime from timing out on its own.
 
+## Compute units
+
+Colab bills runtimes in compute units by the hour, and a balance that runs out ends GPU runtimes. When the Colab tab is
+in colab-bridge's own Chrome (`colab-bridge open`), the bridge reads the account's compute units from it every 15
+minutes and warns, as above, while they would last less than a day at the current rate, at most every 6 hours.
+`colab-bridge quota` reads them now:
+
+```console
+$ colab-bridge quota
+890.0 compute units left, 8.9 an hour over 1 runtime: about 100 h (read 14:05)
+```
+
+`--json` gives the reading, the balance now and the hours left to scripts; `who` shows the latest reading too. Between
+readings, or when the tab is elsewhere, the balance is carried forward from the latest reading at its rate and marked as
+an estimate. The bridge asks for the numbers the way Colab's own Resources panel does, from inside the tab with its
+sign-in, through Chrome's debugging port on 127.0.0.1 (9765, or `--debug-port` / `COLAB_BRIDGE_DEBUG_PORT`). If Colab
+moves them, `quota` lists the requests the page itself made, to find where they went.
+
 ## Hidden tabs
 
 Chrome slows down pages it considers hidden: a background tab, a minimized window, or one covered by other windows.
@@ -152,6 +170,9 @@ before it.
 - The bridge only relays the notebook's tool calls; your Google sign-in stays in the browser.
 - `colab-bridge open` passes the link to Chrome on its command line, where other users of this machine can read it in
   the process list. On a machine you share, paste the link into the tab instead.
+- colab-bridge's own Chrome listens for Chrome's debugging protocol on 127.0.0.1, so programs of this machine's users
+  can drive it, its Google sign-in included: the same trust the control socket asks for. Your everyday Chrome has no
+  such port.
 
 ## Limits
 

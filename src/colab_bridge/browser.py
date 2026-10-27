@@ -6,12 +6,17 @@ their timers fire at most once a minute and their renderer gets less of the CPU.
 most of the time, so its cells answer late and fetch drops to a few KB/s. `colab-bridge open` opens the bridge's link
 in a separate Chrome profile started without that throttling. The person signs in to Google in that profile once, and
 it stays signed in; their everyday Chrome and its profile are not touched.
+
+That Chrome also listens for Chrome's debugging protocol on 127.0.0.1 (port 9765, or COLAB_BRIDGE_DEBUG_PORT), through
+which the bridge reads the account's compute units from the Colab tab (colab_bridge.quota).
 """
 
 import os
 import shutil
 import subprocess
 import sys
+
+from colab_bridge import quota
 
 DEFAULT_PROFILE = os.path.expanduser("~/.cache/colab-bridge/chrome")
 MAC_CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -30,14 +35,14 @@ def find_chrome(explicit: str = None):
     return next((path for path in map(shutil.which, PATH_NAMES) if path), None)
 
 
-def chrome_command(chrome: str, profile: str, link: str) -> list:
+def chrome_command(chrome: str, profile: str, link: str, debug_port: int = None) -> list:
     """The command that opens link in a new window of the bridge's Chrome. A Chrome already running on that profile
     opens the window itself and keeps the switches it started with, which are these."""
     return [chrome, f"--user-data-dir={profile}", "--no-first-run", "--no-default-browser-check", *UNTHROTTLED,
-            "--new-window", link]
+            f"--remote-debugging-port={debug_port or quota.debug_port()}", "--new-window", link]
 
 
-def open_link(link: str, chrome: str = None, profile: str = None) -> list:
+def open_link(link: str, chrome: str = None, profile: str = None, debug_port: int = None) -> list:
     """Opens link in the bridge's Chrome, detached from this process; returns the command. Raises FileNotFoundError
     when no Chrome is found."""
     chrome = find_chrome(chrome)
@@ -45,7 +50,7 @@ def open_link(link: str, chrome: str = None, profile: str = None) -> list:
         raise FileNotFoundError("Google Chrome was not found: pass --chrome PATH, or set COLAB_BRIDGE_CHROME.")
     profile = os.path.expanduser(profile or DEFAULT_PROFILE)
     os.makedirs(profile, exist_ok=True)
-    command = chrome_command(chrome, profile, link)
+    command = chrome_command(chrome, profile, link, debug_port)
     subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                      start_new_session=True)
     return command

@@ -17,6 +17,8 @@ lock:
            released the old one, which is forgotten there and then; a new notebook (the link opened in another tab) may
            have left the old runtime running in the first tab, which is noticed once, then. A runtime no bridge's tab is
            on is not reminded about, and is forgotten a day after its last cell, by when Colab has ended it.
+  quota    {"reading", "warned"}: the account's latest compute-unit reading (colab_bridge.quota) and when the bridges
+           last warned that it runs low.
 """
 
 import contextlib
@@ -45,7 +47,7 @@ def _load(path: str) -> dict:
             data = json.load(f)
     except (OSError, ValueError):
         data = {}
-    for key, empty in (("claims", []), ("bridges", {}), ("hosts", {})):
+    for key, empty in (("claims", []), ("bridges", {}), ("hosts", {}), ("quota", {})):
         if not isinstance(data.get(key), type(empty)):
             data[key] = empty
     return data

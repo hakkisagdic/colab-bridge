@@ -12,6 +12,8 @@ colab-bridge: keep a Google Colab tab connected to this machine and drive its no
   colab-bridge tools                 list the notebook tools the tab offers
   colab-bridge stop | restart        stop the background bridge, or restart it with the same link
   colab-bridge serve                 run the bridge in the foreground
+  colab-bridge quota [--json]        the account's compute units: how many are left, how many an hour go, how long
+                                     they last (read from the Colab tab in colab-bridge's own Chrome)
 
 Sharing a runtime between projects (tabs opened from bridge links share one runtime):
   colab-bridge claim [--vram GB] [--for 90m] [NOTE ...]
@@ -38,7 +40,7 @@ import subprocess
 import sys
 import time
 
-from colab_bridge import browser, client, registry, server
+from colab_bridge import browser, client, quota, registry, server
 
 PROBE_CELL = """# colab-bridge: runtime probe
 import json, socket, subprocess
@@ -129,13 +131,14 @@ def cmd_open(args):
         print(f"No link in {args.dir} yet: run `colab-bridge start`.", file=sys.stderr)
         return 1
     try:
-        browser.open_link(link, args.chrome, args.profile)
+        browser.open_link(link, args.chrome, args.profile, args.debug_port)
     except (FileNotFoundError, OSError) as e:
         print(e, file=sys.stderr)
         return 1
     print(f"Opened the Colab link in colab-bridge's own Chrome ({args.profile or browser.DEFAULT_PROFILE}), which keeps "
-          "the tab at full speed while it is hidden. The first time, sign in to Google in that window; then connect a "
-          "runtime (for example a GPU) in the tab. Close any older tab of this bridge.")
+          "the tab at full speed while it is hidden and lets the bridge read the account's compute units from it. The "
+          "first time, sign in to Google in that window; then connect a runtime (for example a GPU) in the tab. Close "
+          "any older tab of this bridge.")
     return 0
 
 
@@ -257,12 +260,36 @@ def cmd_release(args):
     return 0
 
 
+def cmd_quota(args):
+    now = time.time()
+    try:
+        reading = quota.read(args.debug_port, args.authuser)
+        with registry.locked() as data:
+            data["quota"]["reading"] = reading
+        live, problem = True, None
+    except quota.QuotaError as e:
+        reading, live, problem = registry.snapshot()["quota"].get("reading"), False, str(e)
+    if args.json:
+        current = reading and (reading if live else quota.estimate(reading, now))
+        print(json.dumps({"live": live, "reading": reading, "now": current,
+                          "hours_left": current and quota.hours_left(current), "problem": problem}))
+        return 0 if reading else 1
+    if reading:
+        print(quota.describe(reading, now, live))
+    if problem:
+        print(("Not read now: " if reading else "") + problem, file=sys.stderr)
+    return 0 if reading else 1
+
+
 def cmd_who(args):
     data = registry.snapshot()
     if args.json:
         print(json.dumps(data, indent=1))
         return 0
     now = time.time()
+    reading = data["quota"].get("reading")
+    if reading:
+        print("compute units: " + quota.describe(reading, now, live=now - reading["at"] < 120))
     hosts = sorted(set(data["hosts"]) | {c["host"] for c in data["claims"]}
                    | {b["host"] for b in data["bridges"].values() if b.get("host")})
     if not hosts:
@@ -348,6 +375,12 @@ def main(argv=None) -> int:
                                   "Google Chrome, or one on PATH)")
         command.add_argument("--profile", default=None, metavar="DIR",
                              help=f"its profile (default: {browser.DEFAULT_PROFILE})")
+        debug_option(command)
+
+    def debug_option(command):
+        command.add_argument("--debug-port", type=int, default=None, metavar="PORT",
+                             help="the debugging port of colab-bridge's Chrome, on 127.0.0.1 (default: "
+                                  f"{quota.DEFAULT_DEBUG_PORT} or {quota.DEBUG_PORT_ENV})")
 
     for name, function in (("serve", cmd_serve), ("start", cmd_start), ("restart", cmd_restart)):
         command = sub.add_parser(name)
@@ -380,6 +413,12 @@ def main(argv=None) -> int:
                        metavar="DURATION", help="how long: 90m, 2h, 1h30m (default: 60m); claim again to renew")
     claim.add_argument("note", nargs="*", help="what runs, for the others")
     claim.set_defaults(fn=cmd_claim)
+    quota_command = sub.add_parser("quota", help="the account's compute units, from the Colab tab")
+    quota_command.add_argument("--json", action="store_true")
+    quota_command.add_argument("--authuser", default=None, metavar="N",
+                               help="which signed-in Google account to ask about (default: the tab's)")
+    debug_option(quota_command)
+    quota_command.set_defaults(fn=cmd_quota)
     who = sub.add_parser("who", help="runtimes, their bridges and claims")
     who.add_argument("--json", action="store_true")
     who.set_defaults(fn=cmd_who)
