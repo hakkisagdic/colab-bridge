@@ -13,7 +13,8 @@ Several projects can share a bridge, and several bridges a runtime (colab_bridge
 a time, stops cells that would land on another runtime than their claims, tells the person at this machine when Colab
 moves the tab away from a GPU runtime, and reminds them of runtimes that sit idle with nobody claiming them. Every 15
 minutes it reads the account's compute units from the Colab tab when that tab is in colab-bridge's own Chrome
-(colab_bridge.quota), and warns when they would last less than a day.
+(colab_bridge.quota), and warns when they would last less than a day. Once Telegram is set up (colab_bridge.telegram),
+those notices go to the phone too, and so do the runtime's alerts that cells brought to the bridge's folder.
 
 The Colab link carries a token: whoever holds it can run code in that runtime. The control socket listens on 127.0.0.1
 only and has no password, so every program of this machine's users can use a running bridge.
@@ -28,9 +29,10 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 
-from colab_bridge import notebook, quota, registry
+from colab_bridge import notebook, quota, registry, telegram
 from colab_bridge.client import tool_value
 
 LINK_FILE = "link.txt"
@@ -39,6 +41,7 @@ LOG_FILE = "bridge.log"
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024  # notebook tool answers carry whole cells; websockets' 1 MiB default is too small
 IDLE_MINUTES = 30  # remind about a runtime that ran no cell and had no claim for this long; 0 turns reminders off
 IDLE_CHECK_S = 60
+EVENTS_CHECK_S = 30  # how soon a runtime's alert that a cell brought goes on to Telegram
 QUOTA_CHECK_S = 15 * 60
 QUOTA_FLOOR_H = 24  # warn when the compute units would last less than this at the current rate
 
@@ -76,13 +79,33 @@ def notify(message: str, command: str = None):
         logging.exception("the notification failed")
 
 
+def to_telegram(message: str):
+    """Sends a notice to Telegram when it is set up (colab_bridge.telegram.notify: rate-limited, never raises); the
+    bridge log says when it could not go, never with the token."""
+    result = telegram.notify(message)
+    if result["error"] and telegram.configured():
+        logging.warning("the notice did not go to Telegram: %s", result["error"])
+
+
+def alerter(port: int, notify_command: str = None):
+    """alert(message) for a bridge on port: notify(), and Telegram in a thread of its own, so the bridge never waits on
+    the network."""
+    def alert(message: str):
+        notify(message, notify_command)
+        if telegram.configured():
+            threading.Thread(target=to_telegram, args=(f"{message}\n— colab-bridge {port}",), daemon=True).start()
+
+    return alert
+
+
 async def answer(req: dict, state: dict, lock: asyncio.Lock, alert, reader=None):
     """The result of one control request. state holds the tab's MCP client ("client", None until the tab connects),
     its connection error and the bridge's port; lock lets one notebook request run at a time; alert(message) tells
-    the person at this machine."""
+    the person at this machine. Status says, besides, which levels of the runtime's events this bridge forwards to
+    Telegram ("forwards": none until Telegram is set up)."""
     tab = state["client"]
     if req["op"] == "status":
-        return {"connected": tab is not None, "error": state["error"]}
+        return {"connected": tab is not None, "error": state["error"], "forwards": telegram.forwarded_levels()}
     if tab is None:
         raise RuntimeError("the Colab tab is not connected yet: open the link from `colab-bridge link`")
     if req["op"] == "list":
@@ -137,6 +160,17 @@ async def remind_idle(idle_minutes: float, alert):
                 alert(message)
         except Exception:
             logging.exception("the idle check failed")
+
+
+async def forward_events(state_dir: str, port: int, every_s: float = EVENTS_CHECK_S):
+    """Every every_s, sends the runtime's new alerts in the bridge's folder to Telegram once it is set up
+    (colab_bridge.telegram.forward_events: each once, those that could not go on the next turn)."""
+    while True:
+        try:
+            await asyncio.to_thread(telegram.forward_events, state_dir, port)
+        except Exception as e:  # noqa: BLE001  a file that could not be read: the next turn tries again
+            logging.warning("the runtime's events were not forwarded: %s: %s", type(e).__name__, e)
+        await asyncio.sleep(every_s)
 
 
 async def watch_quota(alert, every_s: float = QUOTA_CHECK_S, floor_h: float = QUOTA_FLOOR_H):
@@ -207,8 +241,7 @@ async def serve(port: int, state_dir: str, token: str = None, ws_port: int = Non
             state["error"] = f"{type(e).__name__}: {e}"
             logging.error("Colab connection failed: %s", state["error"])
 
-    def alert(message):
-        notify(message, notify_command)
+    alert = alerter(port, notify_command)
 
     os.makedirs(state_dir, exist_ok=True)
     logging.basicConfig(filename=os.path.join(state_dir, LOG_FILE), level=logging.INFO,
@@ -224,6 +257,7 @@ async def serve(port: int, state_dir: str, token: str = None, ws_port: int = Non
         if idle_minutes:
             tasks.append(asyncio.create_task(remind_idle(idle_minutes, alert)))
         tasks.append(asyncio.create_task(watch_quota(alert)))
+        tasks.append(asyncio.create_task(forward_events(state_dir, port)))
         server = await asyncio.start_server(control_handler(state, alert), "127.0.0.1", port, limit=MAX_MESSAGE_BYTES)
         async with server:
             await server.serve_forever()

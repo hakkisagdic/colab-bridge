@@ -27,6 +27,18 @@ Long work without holding the notebook, and messages from the runtime:
                                      what processes on the runtime left in its outbox (/tmp/colab-bridge/outbox.jsonl);
                                      every cell brings it here, into <dir>/events.jsonl
 
+Notices on your phone, through a Telegram bot of your own:
+  colab-bridge telegram setup [--status-command CMD --status-dir DIR]
+                                     once: the bot's token from the macOS keychain (service colab-bridge-telegram), your
+                                     chat from the /start you send the bot; running bridges then send their notices and
+                                     the runtime's alerts there
+  colab-bridge notify TEXT [--every MINUTES]
+                                     send TEXT (or stdin, for -) there: the same text at most once an hour, 20 messages
+                                     an hour at most
+  colab-bridge telegram status | off | listen
+                                     what is set up; stop sending; answer /status (or /durum) from your chat with the
+                                     status command's output, and nothing else
+
 Sharing a runtime between projects (tabs opened from bridge links share one runtime):
   colab-bridge claim [--vram GB] [--for 90m] [NOTE ...]
                                      tell the others you use the runtime, with how much GPU memory, for how long
@@ -52,7 +64,7 @@ import subprocess
 import sys
 import time
 
-from colab_bridge import browser, client, events, jobs, quota, registry, server
+from colab_bridge import browser, client, events, jobs, quota, registry, server, telegram
 
 PROBE_CELL = """# colab-bridge: runtime probe
 import json, socket, subprocess
@@ -288,6 +300,83 @@ def cmd_events(args):
     if not found and not args.json:
         print("No events from the runtime in that time. They come with the cells sent through this bridge.")
     return 0
+
+
+def cmd_notify(args):
+    text = sys.stdin.read() if args.text == ["-"] else " ".join(args.text)
+    result = telegram.notify(text, args.every)
+    every = args.every if args.every is not None else telegram.settings().get("same_text_minutes",
+                                                                               telegram.SAME_TEXT_MINUTES)
+    if args.json:
+        print(json.dumps(result))
+    elif result["sent"]:
+        print("Sent.")
+    elif result["skipped"] == "same text":
+        print(f"Not sent: the same text went within the last {every:g} min.")
+    elif result["skipped"]:
+        print("Not sent: this machine's messages of the last hour reached the cap (per_hour in "
+              f"{telegram.config_path()}); the next message that goes says how many were held back.")
+    else:
+        print(f"Not sent: {result['error']}", file=sys.stderr)
+    return 1 if result["error"] else 0
+
+
+def cmd_telegram_setup(args):
+    section = telegram.setup(args.chat_id, args.keep_chat, args.wait, args.status_command, args.status_dir)
+    print(f"Telegram is set up: notices go to {section['chat']} through {section['bot']} (the chat is kept in "
+          f"{telegram.config_path()}; the token stays in the keychain). Running bridges send theirs from now on; one "
+          "started before this version of colab-bridge sends them once it is restarted.")
+    if section.get("status_command"):
+        where = f" in {section['status_dir']}" if section.get("status_dir") else ""
+        print(f"/status (or /durum) from that chat runs `{section['status_command']}`{where} while "
+              "`colab-bridge telegram listen` runs.")
+    return 0
+
+
+def cmd_telegram_status(args):
+    cfg = telegram.settings()
+    token = bool(os.environ.get(telegram.TOKEN_ENV)) or telegram.has_keychain_token()
+    counts = telegram.sent_last_hour()
+    state = {"configured": telegram.configured(cfg), "token": token, "bot": cfg.get("bot"), "chat": cfg.get("chat"),
+             "status_command": cfg.get("status_command"), "status_dir": cfg.get("status_dir"),
+             "listening": telegram.listening(), "event_levels": telegram.forwarded_levels(cfg),
+             "sent_last_hour": counts["sent"], "held": counts["held"],
+             "per_hour": cfg.get("per_hour", telegram.PER_HOUR),
+             "same_text_minutes": cfg.get("same_text_minutes", telegram.SAME_TEXT_MINUTES),
+             "config": telegram.config_path()}
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False))
+        return 0 if state["configured"] else 1
+    if not state["configured"]:
+        print("Telegram is not set up: run `colab-bridge telegram setup`." + ("" if token else
+              f" First store the bot's token: {telegram.STORE_HINT}"))
+        return 1
+    print(f"Notices go to {state['chat']} through {state['bot']} ({state['config']}); the token is "
+          + ("there." if token else f"missing: {telegram.STORE_HINT}"))
+    print(f"Sent in the last hour: {state['sent_last_hour']} of {state['per_hour']}"
+          + (f", {state['held']} held back by the cap" if state["held"] else "")
+          + f"; the same text at most once in {state['same_text_minutes']:g} min. The runtime's events forwarded: "
+          + (", ".join(state["event_levels"]) or "none"))
+    if state["status_command"]:
+        where = f" in {state['status_dir']}" if state["status_dir"] else ""
+        listener = "a listener answers" if state["listening"] else "no listener runs (colab-bridge telegram listen)"
+        print(f"/status runs `{state['status_command']}`{where}; {listener}.")
+    return 0
+
+
+def cmd_telegram_off(args):
+    was = telegram.off()
+    removes = f"`security delete-generic-password -s {telegram.KEYCHAIN_SERVICE}` removes it"
+    print(f"Telegram is off: nothing more goes to the chat. The token stays in the keychain ({removes})." if was
+          else "Telegram was not set up.")
+    return 0
+
+
+def cmd_telegram_listen(args):
+    try:
+        return telegram.listen(out=lambda line: print(line, flush=True))
+    except KeyboardInterrupt:
+        return 0
 
 
 def cmd_fetch(args):
@@ -552,13 +641,38 @@ def main(argv=None) -> int:
     events_command.add_argument("--level", help="only these: alert, info, ...")
     events_command.add_argument("--json", action="store_true", help="one JSON object a line")
     events_command.set_defaults(fn=cmd_events)
+    notify_command = sub.add_parser("notify", help="send a message to your Telegram chat")
+    notify_command.add_argument("text", nargs="+", help="the message (- reads it from stdin)")
+    notify_command.add_argument("--every", type=float, metavar="MINUTES",
+                                help="send this text at most once in this many minutes (default: same_text_minutes in "
+                                     "the config, 60)")
+    notify_command.add_argument("--json", action="store_true", help='{"sent", "skipped", "error"}')
+    notify_command.set_defaults(fn=cmd_notify)
+    tg = sub.add_parser("telegram", help="notices on your phone through a Telegram bot of your own")
+    tg_sub = tg.add_subparsers(dest="telegram_command", required=True)
+    tg_setup = tg_sub.add_parser("setup", help="the token from the keychain, your chat from its /start to the bot")
+    tg_setup.add_argument("--wait", type=float, default=telegram.SETUP_WAIT_S, metavar="SECONDS",
+                          help=f"how long to wait for the /start (default: {telegram.SETUP_WAIT_S})")
+    tg_setup.add_argument("--chat-id", type=int, help="this chat instead of the one that sends /start")
+    tg_setup.add_argument("--keep-chat", action="store_true", help="the chat set up before (to change the rest)")
+    tg_setup.add_argument("--status-command", metavar="CMD",
+                          help='what /status (or /durum) runs, without a shell (e.g. "python3 tools/status.py"); '
+                               '"" removes it')
+    tg_setup.add_argument("--status-dir", metavar="DIR", help="where it runs")
+    tg_setup.set_defaults(fn=cmd_telegram_setup)
+    tg_status = tg_sub.add_parser("status", help="what is set up (never the token or the chat's id)")
+    tg_status.add_argument("--json", action="store_true")
+    tg_status.set_defaults(fn=cmd_telegram_status)
+    tg_sub.add_parser("off", help="stop sending: the chat leaves the config").set_defaults(fn=cmd_telegram_off)
+    tg_sub.add_parser("listen", help="answer /status (or /durum) from your chat, nothing else (runs until stopped)") \
+        .set_defaults(fn=cmd_telegram_listen)
 
     args = parser.parse_args(argv)
     args.dir = os.path.expanduser(args.dir) if args.dir else client.default_dir(args.port)
     args.project = args.project or os.environ.get("COLAB_BRIDGE_PROJECT") or os.path.basename(os.getcwd()) or "default"
     try:
         return args.fn(args)
-    except client.BridgeError as e:
+    except (client.BridgeError, telegram.TelegramError) as e:
         print(e, file=sys.stderr)
         return 1
 

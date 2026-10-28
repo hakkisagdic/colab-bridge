@@ -180,6 +180,53 @@ kept the lines moves it: a cell whose answer never came back leaves them for the
 same lines keep them once. A line still being written waits for its end. The outbox is append-only (a runtime lives a
 day at most); `"level"` is yours to choose, and `"alert"` is the one meant for a person.
 
+## Notices on your phone (Telegram)
+
+Desktop notifications reach you only at the desk. With a Telegram bot of your own, the bridges' notices (a tab moved
+away from a GPU runtime, an idle runtime, compute units running low) and the runtime's alerts reach your phone, and so
+does anything a script sends with `colab-bridge notify`.
+
+1. In Telegram, ask [@BotFather](https://t.me/BotFather) for `/newbot`; it gives the bot's token.
+2. Keep the token in the macOS keychain. This asks for it without showing it, and it never lands in your shell history:
+
+   ```bash
+   security add-generic-password -s colab-bridge-telegram -a "$USER" -w
+   ```
+
+   (Elsewhere, put it in `COLAB_BRIDGE_TELEGRAM_TOKEN` for the bridges and scripts that send.)
+3. Send `/start` to your bot, then run `colab-bridge telegram setup`: it reads the token, finds your chat in the bot's
+   updates and sends it a first message. Only a private chat that sent `/start` counts; if two did, it asks you to try
+   again.
+4. Try it: `colab-bridge notify "hello from colab-bridge"`.
+
+```bash
+colab-bridge notify "the nightly copy is done"   # or: some-command | colab-bridge notify -
+colab-bridge telegram status                     # where messages go, how many went this hour (never the token)
+colab-bridge telegram off                        # stop sending
+```
+
+The same text goes at most once an hour (`--every MINUTES` for one call, `same_text_minutes` in the config for all),
+and this machine sends at most 20 messages an hour (`per_hour`); the next message that goes says how many the cap held
+back. Running bridges send their notices, and each runtime event at level `alert` that their cells brought
+(`event_levels` in the config, or `"events": false` for none) once; an event that could not go is tried again 30 seconds
+later. A bridge started before this version sends them once it is restarted; `colab-bridge status` says which levels a
+bridge forwards (`"forwards"`).
+
+**Asking for the status.** Give setup a command and the folder it runs in, and keep `colab-bridge telegram listen`
+running (a login item, a launchd job, a tmux pane):
+
+```bash
+colab-bridge telegram setup --status-command "python3 tools/status.py" --status-dir ~/my-project
+colab-bridge telegram listen
+```
+
+`/status` (or `/durum`) from your chat then runs that command and sends back what it printed. That is all the listener
+does: it runs no other command, takes no word of the message into the command (no shell runs it), and answers no other
+chat. One listener runs per machine; a second one exits at once.
+
+The config is `~/.config/colab-bridge/config.json` (or `COLAB_BRIDGE_CONFIG`), readable by you alone. From Python:
+`from colab_bridge import telegram; telegram.notify("text")` returns `{"sent", "skipped", "error"}` and never raises.
+
 ## Hidden tabs
 
 Chrome slows down pages it considers hidden: a background tab, a minimized window, or one covered by other windows.
@@ -226,6 +273,9 @@ before it.
 - colab-bridge's own Chrome listens for Chrome's debugging protocol on 127.0.0.1, so programs of this machine's users
   can drive it, its Google sign-in included: the same trust the control socket asks for. Your everyday Chrome has no
   such port.
+- The Telegram bot's token stays in the keychain: colab-bridge reads it with `security` when a message goes, and never
+  prints it, logs it or passes it on a command line. Whoever holds it can speak as your bot and read what is sent to
+  it; if it leaks, ask @BotFather for `/revoke`. The listener answers your chat alone, with your command's output.
 
 ## Limits
 

@@ -148,7 +148,7 @@ def test_cli(bridge, tmp_path, capsys):
     assert cli.main(["--port", str(bridge.port), "run", str(cell), "--env", "WHO=colab"]) == 0
     assert "hello colab" in capsys.readouterr().out
     assert cli.main(["--port", str(bridge.port), "status"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"connected": True, "error": None}
+    assert json.loads(capsys.readouterr().out) == {"connected": True, "error": None, "forwards": []}  # no Telegram
     assert cli.main(["--port", str(bridge.port), "tools"]) == 0
     assert capsys.readouterr().out.split() == ["get_cells", "run_code_cell"]
     assert cli.main(["--port", str(bridge.port), "--dir", str(tmp_path), "link"]) == 1  # no link yet

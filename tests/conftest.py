@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from colab_bridge import events, jobs, registry, server
+from colab_bridge import events, jobs, registry, server, telegram
 
 
 class FakeNotebook:
@@ -78,6 +78,17 @@ class FakeTab:
 @pytest.fixture(autouse=True)
 def own_registry(tmp_path, monkeypatch):
     monkeypatch.setenv(registry.REGISTRY_ENV, str(tmp_path / "registry.json"))
+
+
+@pytest.fixture(autouse=True)
+def no_telegram(tmp_path, monkeypatch):
+    """No test reaches Telegram or this machine's keychain: the config is the test's own (no chat set up), the token
+    is none, and the Bot API a closed port, until a test sets them (test_telegram's fake Bot API)."""
+    monkeypatch.setenv(telegram.CONFIG_ENV, str(tmp_path / "config.json"))
+    monkeypatch.setenv(telegram.API_ENV, "http://127.0.0.1:9")
+    monkeypatch.delenv(telegram.TOKEN_ENV, raising=False)
+    monkeypatch.setattr(telegram, "keychain_token", lambda: None)
+    monkeypatch.setattr(telegram, "has_keychain_token", lambda: False)
 
 
 @pytest.fixture(autouse=True)
