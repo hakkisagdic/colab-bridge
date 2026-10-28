@@ -323,9 +323,10 @@ def cmd_notify(args):
 
 def cmd_telegram_setup(args):
     section = telegram.setup(args.chat_id, args.keep_chat, args.wait, args.status_command, args.status_dir)
+    token = f"from {telegram.TOKEN_ENV}" if os.environ.get(telegram.TOKEN_ENV) else "stays in the keychain"
     print(f"Telegram is set up: notices go to {section['chat']} through {section['bot']} (the chat is kept in "
-          f"{telegram.config_path()}; the token stays in the keychain). Running bridges send theirs from now on; one "
-          "started before this version of colab-bridge sends them once it is restarted.")
+          f"{telegram.config_path()}; the token {token}). Running bridges send theirs from now on; one started before "
+          "this version of colab-bridge sends them once it is restarted.")
     if section.get("status_command"):
         where = f" in {section['status_dir']}" if section.get("status_dir") else ""
         print(f"/status (or /durum) from that chat runs `{section['status_command']}`{where} while "
